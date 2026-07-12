@@ -134,6 +134,36 @@ const ACQUIRE_ATTEMPTS: usize = 14;
 const YIELDS_BEFORE_INIT: usize = 2;
 const LOCKED: usize = 0;
 
+/// RAII guard for the write lock. Restores the lock on drop, including during
+/// unwinding, so a panicking `pred`, `init`, or `f` can never leave the `VLock`
+/// permanently locked for future writers.
+struct LockGuard<'a> {
+    state: &'a atomic::AtomicUsize,
+    value: usize,
+}
+
+impl<'a> LockGuard<'a> {
+    #[inline(always)]
+    fn new(state: &'a atomic::AtomicUsize) -> LockGuard<'a> {
+        loop {
+            let value = state.swap(LOCKED, atomic::Ordering::Acquire);
+            if value != LOCKED {
+                return LockGuard { state, value };
+            }
+            thread::yield_now();
+        }
+    }
+}
+
+impl Drop for LockGuard<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        debug_assert_ne!(self.value, LOCKED, "locking unlock");
+        let value = self.state.swap(self.value, atomic::Ordering::Release);
+        debug_assert_eq!(value, LOCKED, "unlock without lock");
+    }
+}
+
 /// A versioned lock.
 ///
 /// Allows multiple readers and a single writer at a time. Reads are wait-free,
@@ -279,17 +309,6 @@ impl<T, const N: usize> VLock<T, N> {
     }
 
     #[inline(always)]
-    fn lock(&self) -> usize {
-        loop {
-            let value = self.length.swap(LOCKED, atomic::Ordering::Acquire);
-            if value != LOCKED {
-                return value;
-            }
-            thread::yield_now();
-        }
-    }
-
-    #[inline(always)]
     fn acquire<I>(&self, curr_offset: usize, length: usize, init: I) -> usize
     where
         I: FnOnce() -> T,
@@ -355,16 +374,6 @@ impl<T, const N: usize> VLock<T, N> {
             // yielding in between.
             thread::yield_now();
         }
-    }
-
-    #[inline(always)]
-    fn unlock(&self, value: usize) {
-        assert_ne!(value, LOCKED, "locking unlock");
-        assert_eq!(
-            self.length.swap(value, atomic::Ordering::Release),
-            LOCKED,
-            "unlock without lock"
-        );
     }
 
     /// Locks this `VLock` and calls `f` with the current and one of the
@@ -441,7 +450,7 @@ impl<T, const N: usize> VLock<T, N> {
         F: FnOnce(&T, &mut T),
         I: FnOnce() -> T,
     {
-        let mut length = self.lock();
+        let mut guard = LockGuard::new(&self.length);
         // Relaxed is fine, because all changes to the offset are behind a
         // lock which was acquired just above.
         let offset = self.state.load(atomic::Ordering::Relaxed) & Self::OFFSET;
@@ -452,13 +461,12 @@ impl<T, const N: usize> VLock<T, N> {
         let version = unsafe { self.at(offset).assume_init_ref() };
 
         if !pred(&version.value) {
-            self.unlock(length);
             return false;
         }
 
-        let new_offset = self.acquire(offset, length, init);
-        if new_offset == length {
-            length = length.saturating_add(1);
+        let new_offset = self.acquire(offset, guard.value, init);
+        if new_offset == guard.value {
+            guard.value = guard.value.saturating_add(1);
         }
         f(
             &version.value,
@@ -497,7 +505,6 @@ impl<T, const N: usize> VLock<T, N> {
             .state
             .fetch_add(prev_state & Self::COUNTER, atomic::Ordering::Relaxed);
 
-        self.unlock(length);
         true
     }
 
