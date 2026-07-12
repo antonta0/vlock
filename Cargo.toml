@@ -11,3 +11,11 @@ keywords = ["concurrency", "lock", "rwlock", "thread", "wait-free"]
 categories = ["concurrency", "memory-management"]
 
 [dependencies]
+
+[features]
+default = ["std"]
+std = []
+
+[[example]]
+name = "threaded"
+required-features = ["std"]

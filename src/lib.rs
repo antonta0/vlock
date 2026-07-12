@@ -84,46 +84,25 @@
 //! # Usage
 //!
 //! ```
-//! use std::sync::Arc;
-//! use std::thread;
-//! use std::time;
-//!
 //! use vlock::VLock;
 //!
-//! let lock = Arc::new(VLock::<String, 4>::new(String::from("hi there!")));
-//! let lock_clone = Arc::clone(&lock);
-//! let t = thread::spawn(move || {
-//!     for _ in 0..5 {
-//!         println!("{}", *lock_clone.read());
-//!         thread::sleep(time::Duration::from_millis(1));
-//!     }
-//!     lock_clone.update(
-//!         |_, value| {
-//!             value.clear();
-//!             value.push_str("bye!");
-//!         },
-//!         String::new
-//!     );
-//! });
-//! thread::sleep(time::Duration::from_millis(2));
-//! lock.update(
-//!     |_, value| {
-//!         value.clear();
-//!         value.push_str("here's some text for you");
-//!     },
-//!     String::new
-//! );
-//! if let Err(err) = t.join() {
-//!     println!("thread has failed: {err:?}");
-//! }
-//! assert_eq!(*lock.read(), "bye!");
+//! let lock: VLock<_, 2> = 10.into();
+//! assert_eq!(*lock.read(), 10);
+//!
+//! // Initializing new version with 0 and adding 8 to that.
+//! lock.update(|_, value| *value += 8, || 0);
+//! assert_eq!(*lock.read(), 8);
+//!
+//! // Writing to the first initialized version.
+//! lock.update(|_, value| *value += 32, || 0);
+//! assert_eq!(*lock.read(), 42);
 //! ```
 
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::inline_always)]
 
-use std::{borrow, cell, fmt, hash, hint, marker, mem, ops, ptr, sync::atomic, thread};
+use core::{borrow, cell, fmt, hash, hint, marker, mem, ops, ptr, sync::atomic};
 
 // The number of attempts to acquire one of old versions for updating, spinning
 // in between attempts exponentially.
@@ -150,7 +129,7 @@ impl<'a> LockGuard<'a> {
             if value != LOCKED {
                 return LockGuard { state, value };
             }
-            thread::yield_now();
+            yield_now();
         }
     }
 }
@@ -353,7 +332,7 @@ impl<T, const N: usize> VLock<T, N> {
                         hint::spin_loop();
                     }
                 } else {
-                    thread::yield_now();
+                    yield_now();
                 }
                 remaining -= 1;
             }
@@ -372,7 +351,7 @@ impl<T, const N: usize> VLock<T, N> {
             // No new versions can be initialized and previous versions are busy.
             // From this point on there will be just one attempt to acquire,
             // yielding in between.
-            thread::yield_now();
+            yield_now();
         }
     }
 
@@ -770,21 +749,44 @@ impl<T, const N: usize> hash::Hash for ReadRef<'_, T, N> {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::HashSet;
+    /// use core::hash::{Hash, Hasher};
     ///
     /// use vlock::VLock;
     ///
+    /// // Minimal Hasher so this example doesn't need `std`.
+    /// #[derive(Default)]
+    /// struct SimpleHasher(u64);
+    ///
+    /// impl Hasher for SimpleHasher {
+    ///     fn finish(&self) -> u64 {
+    ///         self.0
+    ///     }
+    ///
+    ///     fn write(&mut self, bytes: &[u8]) {
+    ///         for &byte in bytes {
+    ///             self.0 = self.0.wrapping_mul(31).wrapping_add(byte as u64);
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// fn hash_of<T: Hash>(value: &T) -> u64 {
+    ///     let mut hasher = SimpleHasher::default();
+    ///     value.hash(&mut hasher);
+    ///     hasher.finish()
+    /// }
+    ///
     /// let lock: VLock<_, 2> = 10.into();
-    /// let mut ptr_set = HashSet::new();
-    /// let mut val_set = HashSet::new();
-    /// assert!(ptr_set.insert(lock.read()));
-    /// assert!(val_set.insert(*lock.read()));
-    /// assert!(!ptr_set.insert(lock.read()));
-    /// assert!(!val_set.insert(*lock.read()));
+    /// let read1 = lock.read();
+    /// let read2 = lock.read();
+    /// // Same version, so both hash the same.
+    /// assert_eq!(hash_of(&read1), hash_of(&read2));
     ///
     /// lock.update(|curr, value| *value = *curr, || 0);
-    /// assert!(ptr_set.insert(lock.read()));
-    /// assert!(!val_set.insert(*lock.read()));
+    /// let read3 = lock.read();
+    /// // A new version, so the pointer-based hash differs...
+    /// assert_ne!(hash_of(&read2), hash_of(&read3));
+    /// // ...even though the value itself is unchanged.
+    /// assert_eq!(*read2, *read3);
     /// ```
     #[inline(always)]
     fn hash<H: hash::Hasher>(&self, state: &mut H) {
@@ -818,4 +820,16 @@ impl<T, const N: usize> Drop for ReadRef<'_, T, N> {
             atomic::Ordering::Release,
         );
     }
+}
+
+#[cfg(feature = "std")]
+#[inline(always)]
+fn yield_now() {
+    std::thread::yield_now();
+}
+
+#[cfg(not(feature = "std"))]
+#[inline(always)]
+fn yield_now() {
+    hint::spin_loop();
 }
