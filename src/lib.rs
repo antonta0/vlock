@@ -207,7 +207,6 @@ impl<T, const N: usize> VLock<T, N> {
     const COUNTER: usize = !Self::OFFSET;
 
     /// Creates a new unlocked instance of `VLock` with the initial version.
-    #[inline(always)]
     pub fn new(value: T) -> Self {
         // SAFETY: The assume_init is for the array of MaybeUninits.
         let mut data: [mem::MaybeUninit<Data<T>>; N] =
@@ -287,7 +286,7 @@ impl<T, const N: usize> VLock<T, N> {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn acquire<I>(&self, curr_offset: usize, length: usize, init: I) -> usize
     where
         I: FnOnce() -> T,
@@ -394,7 +393,7 @@ impl<T, const N: usize> VLock<T, N> {
     /// lock.update(|_, value| *value += 20, || 13);
     /// assert_eq!(*lock.read(), 30);
     /// ```
-    #[inline(always)]
+    #[inline]
     pub fn update<F, I>(&self, f: F, init: I)
     where
         F: FnOnce(&T, &mut T),
@@ -528,7 +527,7 @@ impl<T: Default, const N: usize> VLock<T, N> {
     /// lock.update_default(|_, value| *value += 20);
     /// assert_eq!(*lock.read(), 30);
     /// ```
-    #[inline(always)]
+    #[inline]
     pub fn update_default<F>(&self, f: F)
     where
         F: FnOnce(&T, &mut T),
@@ -555,7 +554,7 @@ impl<T: Default, const N: usize> VLock<T, N> {
     /// assert!(lock.compare_update_default(|curr| *curr < 30, |_, value| *value += 20));
     /// assert_eq!(*lock.read(), 20);
     /// ```
-    #[inline(always)]
+    #[inline]
     pub fn compare_update_default<P, F>(&self, pred: P, f: F) -> bool
     where
         P: FnOnce(&T) -> bool,
@@ -634,7 +633,6 @@ impl<T, const N: usize> fmt::Debug for VLock<T, N> {
 }
 
 impl<T, const N: usize> Drop for VLock<T, N> {
-    #[inline(always)]
     fn drop(&mut self) {
         // SAFETY: Exclusive mutable access is guaranteed by the compiler.
         for init in unsafe { &mut *self.data.get() }
