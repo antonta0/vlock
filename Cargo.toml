@@ -12,6 +12,9 @@ categories = ["concurrency", "memory-management"]
 
 [dependencies]
 
+[target.'cfg(loom)'.dependencies]
+loom = { version = "0.7", features = ["checkpoint"] }
+
 [features]
 default = ["std"]
 std = []

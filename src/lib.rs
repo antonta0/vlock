@@ -102,7 +102,12 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::inline_always)]
 
-use core::{borrow, cell, fmt, hash, hint, marker, mem, ops, ptr, sync::atomic};
+use core::{borrow, fmt, hash, hint, marker, mem, ops, ptr};
+#[cfg(not(loom))]
+use core::{cell::UnsafeCell, sync::atomic};
+
+#[cfg(loom)]
+use loom::{cell::UnsafeCell, sync::atomic};
 
 // The number of attempts to acquire one of old versions for updating, spinning
 // in between attempts exponentially.
@@ -195,7 +200,8 @@ pub struct VLock<T, const N: usize> {
 
     // Versions of data, initialized lazily. Each item in the array keeps its
     // own state to check whether this version is still in use.
-    data: cell::UnsafeCell<[mem::MaybeUninit<Data<T>>; N]>,
+    //data: UnsafeCell<[mem::MaybeUninit<Data<T>>; N]>,
+    data: [UnsafeCell<mem::MaybeUninit<Data<T>>>; N],
 }
 
 impl<T, const N: usize> VLock<T, N> {
@@ -209,28 +215,49 @@ impl<T, const N: usize> VLock<T, N> {
     /// Creates a new unlocked instance of `VLock` with the initial version.
     pub fn new(value: T) -> Self {
         // SAFETY: The assume_init is for the array of MaybeUninits.
-        let mut data: [mem::MaybeUninit<Data<T>>; N] =
-            unsafe { mem::MaybeUninit::uninit().assume_init() };
-        data[0].write(Data {
+        //let data: [UnsafeCell<mem::MaybeUninit<Data<T>>>; N] =
+        //    unsafe { mem::MaybeUninit::uninit().assume_init() };
+
+        let data: [UnsafeCell<mem::MaybeUninit<Data<T>>>; N] =
+            core::array::from_fn(|_| UnsafeCell::new(mem::MaybeUninit::uninit()));
+
+        let lock = Self {
+            state: atomic::AtomicUsize::new(0),
+            length: atomic::AtomicUsize::new(1),
+            data: data,
+        };
+        // SAFETY: `lock` isn't shared yet, so this is the only access to slot
+        // 0 happening anywhere — no concurrent read or write is possible.
+        unsafe { lock.at_mut(0) }.write(Data {
             state: atomic::AtomicUsize::new(0),
             value,
         });
-        Self {
-            state: atomic::AtomicUsize::new(0),
-            length: atomic::AtomicUsize::new(1),
-            data: cell::UnsafeCell::new(data),
-        }
+        lock
     }
 
     #[inline(always)]
     unsafe fn at(&self, offset: usize) -> &mem::MaybeUninit<Data<T>> {
-        &(*self.data.get())[offset]
+        #[cfg(loom)]
+        {
+            self.data[offset].with(|ptr| &*ptr)
+        }
+        #[cfg(not(loom))]
+        {
+            &(*self.data[offset].get())
+        }
     }
 
     #[allow(clippy::mut_from_ref)]
     #[inline(always)]
     unsafe fn at_mut(&self, offset: usize) -> &mut mem::MaybeUninit<Data<T>> {
-        &mut (*self.data.get())[offset]
+        #[cfg(loom)]
+        {
+            self.data[offset].with_mut(|ptr| &mut *ptr)
+        }
+        #[cfg(not(loom))]
+        {
+            &mut (*self.data[offset].get())
+        }
     }
 
     /// Acquires a reference to the current version of `T`.
@@ -299,14 +326,38 @@ impl<T, const N: usize> VLock<T, N> {
                 }
 
                 // SAFETY: No concurrent mutations can happen because of the lock.
-                if let Some(state) = unsafe { &*self.data.get() }
+                #[cfg(loom)]
+                if let Some(state) = self
+                    .data
                     .iter()
                     .enumerate()
                     .take(length)
                     .filter(|(offset, _)| *offset != curr_offset)
                     // SAFETY: Length counts inits. It's safe to assume that
                     // the first length MaybeUninits are inits.
-                    .map(|(_, init)| unsafe { init.assume_init_ref() })
+                    .map(|(_, init)| unsafe { init.with(|ptr| (&*ptr).assume_init_ref()) })
+                    // These versions are not "active", i.e. there are no new reads to
+                    // these happening at this point, only some old readers may be
+                    // holding on to these.
+                    //
+                    // Taking Acquire here to ensure that all access to that version
+                    // has completed before it can be reused.
+                    .map(|version| version.state.load(atomic::Ordering::Acquire))
+                    .find(|&state| state & Self::COUNTER == 0)
+                {
+                    return state & Self::OFFSET;
+                }
+
+                #[cfg(not(loom))]
+                if let Some(state) = self
+                    .data
+                    .iter()
+                    .enumerate()
+                    .take(length)
+                    .filter(|(offset, _)| *offset != curr_offset)
+                    // SAFETY: Length counts inits. It's safe to assume that
+                    // the first length MaybeUninits are inits.
+                    .map(|(_, init)| unsafe { (&*init.get()).assume_init_ref() })
                     // These versions are not "active", i.e. there are no new reads to
                     // these happening at this point, only some old readers may be
                     // holding on to these.
@@ -500,6 +551,9 @@ impl<T, const N: usize> VLock<T, N> {
     /// ```
     #[inline(always)]
     pub fn get_mut(&mut self) -> &mut T {
+        #[cfg(loom)]
+        let offset = self.state.with_mut(|ptr| *ptr) & Self::OFFSET;
+        #[cfg(not(loom))]
         let offset = *self.state.get_mut() & Self::OFFSET;
         // SAFETY: Exclusive mutable access is guaranteed by the compiler.
         // Current offset always points to init data - see new() and update().
@@ -588,31 +642,65 @@ impl<T: Clone, const N: usize> Clone for VLock<T, N> {
     }
 
     fn clone_from(&mut self, source: &Self) {
+        #[cfg(loom)]
+        let offset = self.state.with_mut(|ptr| *ptr) & Self::OFFSET;
+        #[cfg(not(loom))]
         let offset = *self.state.get_mut() & Self::OFFSET;
         // SAFETY: Exclusive mutable access is guaranteed by the compiler.
         let current = unsafe { self.at_mut(offset).assume_init_mut() };
-        *current.state.get_mut() = 0;
+        #[cfg(loom)]
+        {
+            current.state.with_mut(|ptr| *ptr = 0);
+        }
+        #[cfg(not(loom))]
+        {
+            *current.state.get_mut() = 0;
+        }
         current.value.clone_from(&source.read());
         if offset != 0 {
             // SAFETY: Exclusive mutable access is guaranteed by the compiler.
             let first = unsafe { self.at_mut(0).assume_init_mut() };
             mem::swap(first, current);
         }
-        *self.state.get_mut() = 0;
+        #[cfg(loom)]
+        {
+            self.state.with_mut(|ptr| *ptr = 0);
+        }
+        #[cfg(not(loom))]
+        {
+            *self.state.get_mut() = 0;
+        }
 
         // SAFETY: Exclusive mutable access is guaranteed by the compiler.
-        for init in unsafe { &mut *self.data.get() }
+        #[cfg(loom)]
+        for init in self
+            .data
             .iter_mut()
-            .take(*self.length.get_mut())
+            .take(self.length.with_mut(|ptr| *ptr))
             .skip(1)
         {
             // SAFETY: Length counts inits. It's safe to assume that the first
             // length MaybeUninits are inits.
-            let state = &mut unsafe { init.assume_init_mut() }.state;
-            assert_eq!(*state.get_mut() & Self::COUNTER, 0);
-            unsafe { init.assume_init_drop() };
+            let state = &mut unsafe { init.with_mut(|ptr| (&mut *ptr).assume_init_mut()) }.state;
+            assert_eq!(state.with_mut(|ptr| *ptr) & Self::COUNTER, 0);
+            unsafe { init.with_mut(|ptr| (&mut *ptr).assume_init_drop()) };
         }
-        *self.length.get_mut() = 1;
+        #[cfg(not(loom))]
+        for init in self.data.iter_mut().take(*self.length.get_mut()).skip(1) {
+            // SAFETY: Length counts inits. It's safe to assume that the first
+            // length MaybeUninits are inits.
+            let state = &mut unsafe { init.get_mut().assume_init_mut() }.state;
+            assert_eq!(*state.get_mut() & Self::COUNTER, 0);
+            unsafe { init.get_mut().assume_init_drop() };
+        }
+        #[cfg(loom)]
+        {
+            self.length.with_mut(|ptr| *ptr = 1);
+        }
+        #[cfg(not(loom))]
+        {
+            *self.length.get_mut() = 1;
+        }
     }
 }
 
@@ -635,13 +723,19 @@ impl<T, const N: usize> fmt::Debug for VLock<T, N> {
 impl<T, const N: usize> Drop for VLock<T, N> {
     fn drop(&mut self) {
         // SAFETY: Exclusive mutable access is guaranteed by the compiler.
-        for init in unsafe { &mut *self.data.get() }
-            .iter_mut()
-            .take(*self.length.get_mut())
-        {
+        #[cfg(loom)]
+        for init in self.data.iter_mut().take(self.length.with_mut(|ptr| *ptr)) {
             // SAFETY: Length counts inits. It's safe to assume that the first
             // length MaybeUninits are inits.
-            unsafe { init.assume_init_drop() };
+            unsafe {
+                init.with_mut(|ptr| (&mut *ptr).assume_init_drop());
+            }
+        }
+        #[cfg(not(loom))]
+        for init in self.data.iter_mut().take(*self.length.get_mut()) {
+            // SAFETY: Length counts inits. It's safe to assume that the first
+            // length MaybeUninits are inits.
+            unsafe { (&mut *init.get()).assume_init_drop() };
         }
     }
 }
@@ -823,6 +917,9 @@ impl<T, const N: usize> Drop for ReadRef<'_, T, N> {
 #[cfg(feature = "std")]
 #[inline(always)]
 fn yield_now() {
+    #[cfg(loom)]
+    loom::thread::yield_now();
+    #[cfg(not(loom))]
     std::thread::yield_now();
 }
 
