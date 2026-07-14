@@ -9,15 +9,12 @@
 //!
 //! # Why bother?
 //!
-//! [`VLock`] is a fast[^1] and scalable lock with stable read performance for
-//! non-copy types at the expense of slower writes.
+//! [`VLock`] is a fast and scalable general-purpose lock with stable read
+//! performance for non-copy types at the expense of slower writes.
 //!
-//! It's a common pattern among various sorts of systems, where there is a
+//! It's a common pattern among various sorts of systems, where there are a
 //! number of processing threads, each making decisions via shared state and
-//! some other code that updates that shared state once in a while. In network
-//! infrastructure, for example, this can be thought of data and control planes,
-//! be it routers or various levels of load balancers. In data-heavy applications,
-//! that can be a hot view of some stuff stored in a database.
+//! some other code that updates that shared state once in a while.
 //!
 //! If that roughly describes your use case, you may benefit from this library
 //! at the expense of having 1+ extra copies of data in memory, slightly more
@@ -27,24 +24,20 @@
 //! by avoiding allocations. The extra state is one `usize` plus a `usize`
 //! for every version... and there's not much you can do about slower writes.
 //!
-//! If read performance is critical and readers can't afford to wait for writes,
-//! you may benefit significantly.
+//! As a bonus, the implementation is simple - under 400 lines of code with no
+//! external dependencies - and has been checked with Miri on both `x86_64`
+//! and `arm64`, and model-checked with loom for the reclaim-under-contention
+//! path.
 //!
-//! As a bonus, the implementation is simple with about 200 lines of actual
-//! code and without any external dependencies.
-//!
-//! [^1]: Based on synthetic benchmarks on `x86_64` laptops, read performance was
-//! 1.3-2.0 times faster than `ArcSwap`, and may be order of magnitude faster
-//! than fastest `RwLock` implementation in certain cases. Writes of `VLock`
-//! are more efficient than `ArcSwap`. Comparing to `RwLock`, writes are
-//! generally 1 to 10 times slower than `parking_lot` implementation, but an
-//! improvement over the `std` implementation. With `SeqLock` results were
-//! mixed: in some scenarios reads of `VLock` was 4 times slower, in some about
-//! 1:1 and in other 2 times quicker. Although write performance of `VLock`
-//! is significantly worse than that of `SeqLock`, it can be used for non-copy
-//! types. Note that write performance of `VLock` may degrade significantly
-//! when readers are not progressing and `N` is small, in other words `VLock`
-//! is susceptible to write starvation by prioritizing reads.
+//! Based on synthetic benchmark on `x86_64` 24-vCPU box with 1 writer thread
+//! and 23 reader threads:
+//! ```text
+//! vs parking_lot::RwLock      5-6x faster reads
+//! vs ArcSwap::load_full       1.3x faster reads
+//! vs ArcSwap::load            ~20x slower reads (thread-local, no shared atomic)
+//! vs SeqLock                  ~4x slower reads (Copy-only, no heap types)
+//! writes @ N=2                comparable to ArcSwap, ~2x slower than RwLock
+//! ```
 //!
 //! # How does it work?
 //!
