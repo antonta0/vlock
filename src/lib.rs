@@ -647,6 +647,7 @@ impl<T, const N: usize> Drop for VLock<T, N> {
 }
 
 #[derive(Debug)]
+#[repr(align(64))]
 struct Data<T> {
     // The counter is decremented every time the read reference to that data
     // is dropped, and incremented by the total number of read() calls to that
